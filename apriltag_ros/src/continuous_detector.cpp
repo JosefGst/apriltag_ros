@@ -33,98 +33,130 @@
 
 #include <pluginlib/class_list_macros.hpp>
 
+#include <cartographer_ros_msgs/LandmarkList.h>
+#include <cartographer_ros_msgs/LandmarkEntry.h>
+
 PLUGINLIB_EXPORT_CLASS(apriltag_ros::ContinuousDetector, nodelet::Nodelet);
 
 namespace apriltag_ros
 {
-void ContinuousDetector::onInit ()
-{
-  ros::NodeHandle& nh = getNodeHandle();
-  ros::NodeHandle& pnh = getPrivateNodeHandle();
-
-  tag_detector_ = std::shared_ptr<TagDetector>(new TagDetector(pnh));
-  draw_tag_detections_image_ = getAprilTagOption<bool>(pnh, 
-      "publish_tag_detections_image", false);
-  it_ = std::shared_ptr<image_transport::ImageTransport>(
-      new image_transport::ImageTransport(nh));
-
-  std::string transport_hint;
-  pnh.param<std::string>("transport_hint", transport_hint, "raw");
-
-  int queue_size;
-  pnh.param<int>("queue_size", queue_size, 1);
-  camera_image_subscriber_ =
-      it_->subscribeCamera("image_rect", queue_size,
-                          &ContinuousDetector::imageCallback, this,
-                          image_transport::TransportHints(transport_hint));
-  tag_detections_publisher_ =
-      nh.advertise<AprilTagDetectionArray>("tag_detections", 1);
-  if (draw_tag_detections_image_)
+  void ContinuousDetector::onInit()
   {
-    tag_detections_image_publisher_ = it_->advertise("tag_detections_image", 1);
+    ros::NodeHandle &nh = getNodeHandle();
+    ros::NodeHandle &pnh = getPrivateNodeHandle();
+
+    tag_detector_ = std::shared_ptr<TagDetector>(new TagDetector(pnh));
+    draw_tag_detections_image_ = getAprilTagOption<bool>(pnh,
+                                                         "publish_tag_detections_image", false);
+    it_ = std::shared_ptr<image_transport::ImageTransport>(
+        new image_transport::ImageTransport(nh));
+
+    std::string transport_hint;
+    pnh.param<std::string>("transport_hint", transport_hint, "raw");
+
+    int queue_size;
+    pnh.param<int>("queue_size", queue_size, 1);
+    camera_image_subscriber_ =
+        it_->subscribeCamera("image_rect", queue_size,
+                             &ContinuousDetector::imageCallback, this,
+                             image_transport::TransportHints(transport_hint));
+    tag_detections_publisher_ =
+        nh.advertise<AprilTagDetectionArray>("tag_detections", 1);
+    apriltag_landmark_publisher_ =
+        nh.advertise<cartographer_ros_msgs::LandmarkList>("/landmark", 1);
+    if (draw_tag_detections_image_)
+    {
+      tag_detections_image_publisher_ = it_->advertise("tag_detections_image", 1);
+    }
+
+    refresh_params_service_ =
+        pnh.advertiseService("refresh_tag_params",
+                             &ContinuousDetector::refreshParamsCallback, this);
   }
 
-  refresh_params_service_ =
-      pnh.advertiseService("refresh_tag_params", 
-                          &ContinuousDetector::refreshParamsCallback, this);
-}
-
-void ContinuousDetector::refreshTagParameters()
-{
-  // Resetting the tag detector will cause a new param server lookup
-  // So if the parameters have changed (by someone/something), 
-  // they will be updated dynamically
-  std::scoped_lock<std::mutex> lock(detection_mutex_);
-  ros::NodeHandle& pnh = getPrivateNodeHandle();
-  tag_detector_.reset(new TagDetector(pnh));
-}
-
-bool ContinuousDetector::refreshParamsCallback(std_srvs::Empty::Request& req,
-                                               std_srvs::Empty::Response& res)
-{
-  refreshTagParameters();
-  return true;
-}
-
-void ContinuousDetector::imageCallback (
-    const sensor_msgs::ImageConstPtr& image_rect,
-    const sensor_msgs::CameraInfoConstPtr& camera_info)
-{
-  std::scoped_lock<std::mutex> lock(detection_mutex_);
-  // Lazy updates:
-  // When there are no subscribers _and_ when tf is not published,
-  // skip detection.
-  if (tag_detections_publisher_.getNumSubscribers() == 0 &&
-      tag_detections_image_publisher_.getNumSubscribers() == 0 &&
-      !tag_detector_->get_publish_tf())
+  void ContinuousDetector::refreshTagParameters()
   {
-    // ROS_INFO_STREAM("No subscribers and no tf publishing, skip processing.");
-    return;
+    // Resetting the tag detector will cause a new param server lookup
+    // So if the parameters have changed (by someone/something),
+    // they will be updated dynamically
+    std::scoped_lock<std::mutex> lock(detection_mutex_);
+    ros::NodeHandle &pnh = getPrivateNodeHandle();
+    tag_detector_.reset(new TagDetector(pnh));
   }
 
-  // Convert ROS's sensor_msgs::Image to cv_bridge::CvImagePtr in order to run
-  // AprilTag 2 on the iamge
-  try
+  bool ContinuousDetector::refreshParamsCallback(std_srvs::Empty::Request &req,
+                                                 std_srvs::Empty::Response &res)
   {
-    cv_image_ = cv_bridge::toCvCopy(image_rect, image_rect->encoding);
-  }
-  catch (cv_bridge::Exception& e)
-  {
-    ROS_ERROR("cv_bridge exception: %s", e.what());
-    return;
+    refreshTagParameters();
+    return true;
   }
 
-  // Publish detected tags in the image by AprilTag 2
-  tag_detections_publisher_.publish(
-      tag_detector_->detectTags(cv_image_,camera_info));
-
-  // Publish the camera image overlaid by outlines of the detected tags and
-  // their payload values
-  if (draw_tag_detections_image_)
+  void ContinuousDetector::imageCallback(
+      const sensor_msgs::ImageConstPtr &image_rect,
+      const sensor_msgs::CameraInfoConstPtr &camera_info)
   {
-    tag_detector_->drawDetections(cv_image_);
-    tag_detections_image_publisher_.publish(cv_image_->toImageMsg());
+    std::scoped_lock<std::mutex> lock(detection_mutex_);
+    // Lazy updates:
+    // When there are no subscribers _and_ when tf is not published,
+    // skip detection.
+    if (tag_detections_publisher_.getNumSubscribers() == 0 &&
+        tag_detections_image_publisher_.getNumSubscribers() == 0 &&
+        !tag_detector_->get_publish_tf())
+    {
+      // ROS_INFO_STREAM("No subscribers and no tf publishing, skip processing.");
+      return;
+    }
+
+    // Convert ROS's sensor_msgs::Image to cv_bridge::CvImagePtr in order to run
+    // AprilTag 2 on the iamge
+    try
+    {
+      cv_image_ = cv_bridge::toCvCopy(image_rect, image_rect->encoding);
+    }
+    catch (cv_bridge::Exception &e)
+    {
+      ROS_ERROR("cv_bridge exception: %s", e.what());
+      return;
+    }
+
+    // Publish detected tags in the image by AprilTag 2
+    // tag_detections_publisher_.publish(
+    //     tag_detector_->detectTags(cv_image_, camera_info));
+
+    auto tag_detection_array =
+        tag_detector_->detectTags(cv_image_, camera_info);
+    tag_detections_publisher_.publish(tag_detection_array);
+
+    // Landmark publisher for cartographer
+    cartographer_ros_msgs::LandmarkList apriltag_landmark_list;
+    for (int i = 0; i < tag_detection_array.detections.size(); i++)
+    {
+      AprilTagDetection item = tag_detection_array.detections[i];
+
+      //
+      cartographer_ros_msgs::LandmarkEntry landmark_entry;
+      landmark_entry.id = std::to_string(item.id[0]);
+      landmark_entry.tracking_from_landmark_transform.position = item.pose.pose.pose.position;
+      landmark_entry.tracking_from_landmark_transform.orientation = item.pose.pose.pose.orientation;
+      landmark_entry.translation_weight = 1e2;
+      landmark_entry.rotation_weight = 1e2;
+
+      apriltag_landmark_list.landmarks.push_back(landmark_entry);
+    }
+
+    // if (apriltag_landmark_list.landmarks.size() != 0)
+    // {
+    apriltag_landmark_list.header = tag_detection_array.header;
+    apriltag_landmark_publisher_.publish(apriltag_landmark_list);
+    // }
+
+    // Publish the camera image overlaid by outlines of the detected tags and
+    // their payload values
+    if (draw_tag_detections_image_)
+    {
+      tag_detector_->drawDetections(cv_image_);
+      tag_detections_image_publisher_.publish(cv_image_->toImageMsg());
+    }
   }
-}
 
 } // namespace apriltag_ros
